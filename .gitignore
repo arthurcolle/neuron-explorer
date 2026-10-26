@@ -27,3 +27,6 @@ explorer/cache/head_profiles.json
 
 # experiment scripts
 scripts/
+
+# MLX live-analysis cache
+explorer/cache/connections_mlx.sqlite

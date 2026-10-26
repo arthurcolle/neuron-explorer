@@ -15,22 +15,20 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
+from array_utils import as_numpy, topk
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import CACHE, NO_MODEL, Runtime  # noqa: E402
+from backend import BACKEND, CACHE, MODEL, NO_MODEL, Runtime  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
+# The shipped research caches describe this checkpoint. Cache-only startup stays offline.
+with open(os.path.join(ROOT, "explorer", "model_arch.json")) as _arch_file:
+    ARCH = json.load(_arch_file)["architecture"]
 
 app = FastAPI()
 
@@ -147,7 +145,7 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL, "backend": BACKEND, "arch": ARCH,
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -345,9 +343,9 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     toks = [rt.tok.decode([t]) for t in ids]
     cand = []
     for l, (mx, amx, mn, amn) in acts.items():
-        p = mx.numpy() / np.maximum(sc["pos"][l], 1e-3)
-        q = mn.numpy() / np.minimum(sc["neg"][l], -1e-3)
-        for arr, idx, sign, raw in ((p, amx.numpy(), "+", mx.numpy()), (q, amn.numpy(), "-", mn.numpy())):
+        p = as_numpy(mx) / np.maximum(sc["pos"][l], 1e-3)
+        q = as_numpy(mn) / np.minimum(sc["neg"][l], -1e-3)
+        for arr, idx, sign, raw in ((p, as_numpy(amx), "+", as_numpy(mx)), (q, as_numpy(amn), "-", as_numpy(mn))):
             top = np.argpartition(-arr, limit)[:limit]
             cand += [(float(arr[n]), l, int(n), sign, int(idx[n]), float(raw[n])) for n in top]
     cand.sort(reverse=True)
@@ -822,7 +820,7 @@ def act_range(layer, n):
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
+    return {"model": MODEL, "backend": BACKEND, "arch": ARCH, "layers_with_sweeps": sorted(runs),
             "named_neurons": len(names()), "live_model": not NO_MODEL}
 
 
@@ -1041,18 +1039,19 @@ async def agent_logprobs(req: Request):
             targets.append((t, tid[0], len(tid) > 1))
 
     def view(lp):
-        v, i = lp.topk(k)
+        v, i = topk(lp, k)
         return {"top": [[dec(t), round(float(x), 3)] for x, t in zip(v, i)],
                 "targets": [{"text": t, "token": dec(tid), "logprob": round(float(lp[tid]), 3),
                              **({"first_token_only": True} if multi else {})} for t, tid, multi in targets]}
     if alt is None:
         return view(base)
-    d = alt.exp() - base.exp()  # ranked by probability gained or lost, so the far tail's large log ratios stay out
-    up, down = d.topk(12), (-d).topk(12)
+    base, alt = as_numpy(base), as_numpy(alt)
+    d = np.exp(alt) - np.exp(base)  # ranked by probability gained or lost, so the far tail's large log ratios stay out
+    up, down = topk(d, 12), topk(-d, 12)
     row = lambda i: [dec(i), round(float(base[i]), 2), round(float(alt[i]), 2)]
     return {"baseline": view(base), "intervened": view(alt),
-            "kl": round(float((base.exp() * (base - alt)).sum()), 4),
-            "rose": [row(i) for i in up.indices], "fell": [row(i) for i in down.indices],
+            "kl": round(float((np.exp(base) * (base - alt)).sum()), 4),
+            "rose": [row(i) for i in up[1]], "fell": [row(i) for i in down[1]],
             "rows_are": "[token, baseline logprob, intervened logprob]",
             "pushed": [{"neuron": f"L{l} " + ("MLP (all)" if n is None else f"N{n}"), "dose": dd, "mode": m} for l, n, dd, m in pushes],
             "heads": [{"layer": l, "head": "all" if hd is None else hd, "scale": sc} for l, hd, sc in hs]}
@@ -1788,7 +1787,7 @@ async def _start_reaper():
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    return {"status": rt.status, "backend": BACKEND, "model": MODEL, "error": getattr(rt, "error", None)}
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
@@ -1800,13 +1799,18 @@ def preload():
             rt.status = "no model"
             rt.vocab_strings()
             return
-        rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
-            os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
-            rt.build_lens_index(LENS_INDEX)
-        rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
+        try:
+            rt.ensure_loaded()
+            if not os.path.exists(LENS_INDEX):
+                os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
+                rt.build_lens_index(LENS_INDEX)
+            rt.vocab_strings()
+            if not os.path.exists(ACT_SCALE):
+                rt.build_act_scale(ACT_SCALE)
+        except Exception as exc:
+            rt.status, rt.error = "error", str(exc)
+            import traceback
+            traceback.print_exc()
     threading.Thread(target=go, daemon=True).start()
 
 

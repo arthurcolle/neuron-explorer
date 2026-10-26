@@ -3,14 +3,25 @@ name = "neuron-explorer"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
-    "transformers",
+    "transformers>=5.20.1",
     "safetensors",
     "numpy",
-    "datasets",
-    "accelerate",
     "fastapi>=0.146.0",
     "uvicorn>=0.54.0",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx==0.31.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm==0.30.7; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+torch = ["torch", "accelerate"]
+research = [
+    "datasets",
     "sentence-transformers>=6.1.0",
     "umap-learn>=0.5.12",
 ]
+test = ["pytest>=8", "httpx>=0.28"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

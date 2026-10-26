@@ -7,8 +7,39 @@ rollout is kept, and the explorer lays the results out over a 3D view of the mod
 
 ## Explorer
 
-    uv sync
-    uv run python explorer/server.py        # http://localhost:8791
+Apple Silicon (native MLX):
+
+    uv sync --extra mlx
+    EXPLORER_BACKEND=mlx uv run --no-sync python explorer/server.py  # http://localhost:8791
+
+PyTorch (MPS, CUDA or CPU):
+
+    uv sync --extra torch
+    EXPLORER_BACKEND=torch uv run --no-sync python explorer/server.py
+
+`EXPLORER_BACKEND=auto` (the default) selects MLX on Apple Silicon when installed,
+otherwise PyTorch. The MLX backend implements live three-column steered chat,
+neuron activations, next-token probabilities, head ablations, attention patterns,
+and neuron/head connections. Each chat column has an independent unpadded
+MLX-LM cache, so unequal conversation lengths do not change the baseline.
+
+Both backends use the unquantized `Qwen/Qwen3.5-4B` checkpoint. The first live
+startup downloads approximately 9.32 GB of weights. Quantized MLX checkpoints
+are deliberately rejected: the shipped scientific caches were measured on the
+original weights, not a quantized approximation. Floating-point results are not
+bitwise identical across backends; their DeltaNet numerical implementations differ.
+Live activations are recomputed by the selected backend; shipped caches retain
+their original measurements. `EXPLORER_MODEL` can name a local
+copy of that checkpoint. `explorer/model_arch.json` records its configuration
+revision so browsing the shipped caches does not fetch model configuration.
+
+`EXPLORER_NO_MODEL=1` starts cache-only browsing without downloading weights.
+`/api/status` reports the selected backend, readiness and any model-loading error.
+The server binds to `127.0.0.1`; changing backends does not expand network access.
+The automated CUDA/vLLM sweep scripts below are unchanged, not an MLX sweep port.
+Install `--extra research` for dataset and embedding/rebuild scripts (which may
+also require `--extra torch`). Tests: `uv sync --extra mlx --extra test`, then
+`uv run --no-sync pytest`.
 
 Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
 `explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
